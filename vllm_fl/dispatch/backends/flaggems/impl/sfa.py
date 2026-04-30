@@ -13,7 +13,11 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
-from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
+try:
+    # vLLM >= 0.13 moved MLA attention backends under vllm.v1.
+    from vllm.v1.attention.backends.mla.common import MLACommonMetadataBuilder
+except ModuleNotFoundError:  # pragma: no cover - compatibility with older vLLM
+    from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,

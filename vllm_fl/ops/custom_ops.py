@@ -1,6 +1,7 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 
 import logging
+import os
 from typing import Optional, List
 
 from vllm.model_executor.custom_op import CustomOp
@@ -84,6 +85,32 @@ def register_oot_ops(whitelist: Optional[List[str]] = None) -> None:
 
     # Apply blacklist
     ops_to_register = [op for op in ops_to_register if op not in blacklist]
+
+    # The FL MLA wrapper passes extra SFA-specific modules/kwargs into
+    # MLAAttention. Native vLLM MLA backends such as FlashMLASparseBackend do
+    # not accept those kwargs, so keep the wrapper opt-in unless explicitly
+    # requested. The native MultiHeadLatentAttentionWrapper remains compatible
+    # with the vendor CUDA backend used by DeepSeek V3.2 serving.
+    enable_mla_oot = os.environ.get("VLLM_FL_ENABLE_MLA_OOT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if (
+        "MultiHeadLatentAttentionWrapper" in ops_to_register
+        and not enable_mla_oot
+        and env_whitelist is None
+        and whitelist is None
+    ):
+        logger.info(
+            "Skipping oot op: MultiHeadLatentAttentionWrapper. "
+            "Set VLLM_FL_ENABLE_MLA_OOT=1 to enable the FL MLA wrapper."
+        )
+        ops_to_register = [
+            op for op in ops_to_register
+            if op != "MultiHeadLatentAttentionWrapper"
+        ]
 
     for op_name in ops_to_register:
         if op_name not in OOT_OPS:

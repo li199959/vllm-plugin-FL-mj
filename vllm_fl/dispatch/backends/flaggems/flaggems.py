@@ -8,6 +8,7 @@ This backend provides operator implementations using the FlagGems library.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Union
 
 import torch
@@ -138,9 +139,16 @@ class FlagGemsBackend(Backend):
                 "Falling back to vendor implementation."
             )
 
-        if use_mla and use_sparse:
-            return "vllm_fl.dispatch.backends.flaggems.impl.sfa.FLSFABackend"
-        elif use_mla:
-            raise NotImplementedError("NOT support mla now!") 
+        if use_mla:
+            enable_mla_oot = os.environ.get(
+                "VLLM_FL_ENABLE_MLA_OOT", "0"
+            ).lower() in ("1", "true", "yes", "on")
+            if use_sparse:
+                if enable_mla_oot:
+                    return "vllm_fl.dispatch.backends.flaggems.impl.sfa.FLSFABackend"
+                return AttentionBackendEnum.FLASHMLA_SPARSE.get_path()
+            if enable_mla_oot:
+                raise NotImplementedError("NOT support mla now!")
+            return AttentionBackendEnum.FLASHMLA.get_path()
 
         return AttentionBackendEnum.TRITON_ATTN.get_path()

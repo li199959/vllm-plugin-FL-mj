@@ -153,6 +153,63 @@ class PlatformFL(Platform):
         if compilation_config.compile_sizes is None:
             compilation_config.compile_sizes = []
 
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        is_dsa_cp_model = hf_text_config is not None and hasattr(
+            hf_text_config, "index_topk"
+        )
+        sp_enabled = (
+            model_config is not None
+            and is_dsa_cp_model
+            and parallel_config.tensor_parallel_size > 1
+        )
+        if (
+            sp_enabled
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        ):
+            disable_full_cudagraph = os.environ.get(
+                "VLLM_FL_SP_DISABLE_FULL_CUDAGRAPH", "1"
+            ).lower() in ("1", "true", "yes", "on")
+            if (
+                disable_full_cudagraph
+                and compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                logger.warning(
+                    "Disabling FULL CUDA Graphs for vllm_fl Linear SP on "
+                    "DSA-CP models; using PIECEWISE CUDA Graphs only. "
+                    "FULL decode graph capture includes the SFA/SP attention "
+                    "path and is currently unsafe. Set "
+                    "VLLM_FL_SP_DISABLE_FULL_CUDAGRAPH=0 to opt back in."
+                )
+                compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+            min_capture_size = int(os.environ.get(
+                "VLLM_FL_SP_CUDAGRAPH_MIN_SIZE", "16"
+            ))
+            capture_sizes = compilation_config.cudagraph_capture_sizes
+            if min_capture_size > 0 and capture_sizes:
+                filtered_sizes = [
+                    size for size in capture_sizes
+                    if size >= min_capture_size
+                ]
+                if filtered_sizes and filtered_sizes != capture_sizes:
+                    logger.warning(
+                        "Filtering CUDA Graph capture sizes for vllm_fl "
+                        "Linear SP on DSA-CP models: dropped sizes below %d "
+                        "to avoid DeepGEMM grouped FP8 graph-capture "
+                        "failures. Original=%s, filtered=%s. Set "
+                        "VLLM_FL_SP_CUDAGRAPH_MIN_SIZE=0 to disable this "
+                        "filter.",
+                        min_capture_size,
+                        capture_sizes,
+                        filtered_sizes,
+                    )
+                    compilation_config.cudagraph_capture_sizes = filtered_sizes
+                    compilation_config.max_cudagraph_capture_size = (
+                        filtered_sizes[-1]
+                    )
+                    if hasattr(compilation_config, "post_init_cudagraph_sizes"):
+                        compilation_config.post_init_cudagraph_sizes()
+
         if (
             parallel_config.data_parallel_size > 1
             and compilation_config.cudagraph_mode != CUDAGraphMode.NONE

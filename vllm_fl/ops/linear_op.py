@@ -177,7 +177,10 @@ def _get_column_parallel_op(prefix, layer):
     from vllm_fl.utils import enable_dsa_cp, enable_sp
 
     if enable_dsa_cp() and ("q_b_proj" in prefix or "kv_b_proj" in prefix):
-        return ShardedCPColumnParallelOp(layer)
+        # Native vLLM MLA backends expect the TP-local q_b/kv_b weight shape.
+        # ShardedCPColumnParallelOp expands these projections for the FL SFA
+        # wrapper path, which breaks native FLASHMLA(_SPARSE) weight processing.
+        return None
     if enable_sp():
         if "shared_expert" in prefix:
             return None

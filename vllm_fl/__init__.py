@@ -43,6 +43,21 @@ def register_model():
     from vllm import ModelRegistry
     import vllm.model_executor.models.qwen3_next as qwen3_next_module
 
+    # Patch native DeepSeek V2/V3 decoder layers so Linear SP keeps the
+    # residual stream shape-compatible with vLLM's original forward path.
+    try:
+        from vllm_fl.models.deepseek_v2_sp import (
+            patch_deepseek_v2_decoder_layer_sp,
+        )
+
+        patch_deepseek_v2_decoder_layer_sp()
+        logger.warning(
+            "DeepseekV2DecoderLayer has been patched for vllm_fl Linear SP "
+            "residual handling"
+        )
+    except Exception as e:
+        logger.error(f"Patch DeepSeekV2 SP residual error: {str(e)}")
+
     # Register Qwen3.5 MoE config
     try:
         from vllm.transformers_utils.config import _CONFIG_REGISTRY
