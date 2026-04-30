@@ -8,7 +8,6 @@ This backend provides operator implementations using the FlagGems library.
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Union
 
 import torch
@@ -131,6 +130,7 @@ class FlagGemsBackend(Backend):
             Fully qualified class path string
         """
         from vllm.attention.backends.registry import AttentionBackendEnum
+        from vllm_fl.utils import enable_mla_oot
 
         # TritonAttentionBackend requires CUDA, check if available
         if not torch.cuda.is_available():
@@ -140,14 +140,11 @@ class FlagGemsBackend(Backend):
             )
 
         if use_mla:
-            enable_mla_oot = os.environ.get(
-                "VLLM_FL_ENABLE_MLA_OOT", "0"
-            ).lower() in ("1", "true", "yes", "on")
             if use_sparse:
-                if enable_mla_oot:
+                if enable_mla_oot():
                     return "vllm_fl.dispatch.backends.flaggems.impl.sfa.FLSFABackend"
                 return AttentionBackendEnum.FLASHMLA_SPARSE.get_path()
-            if enable_mla_oot:
+            if enable_mla_oot():
                 raise NotImplementedError("NOT support mla now!")
             return AttentionBackendEnum.FLASHMLA.get_path()
 

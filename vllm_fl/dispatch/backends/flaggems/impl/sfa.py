@@ -387,6 +387,29 @@ class FLSFAImpl(MLAAttentionImpl):
             self.is_aiter_triton_fp8_bmm_enabled = False
 
         # MLA Args
+        required_kwargs = (
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "qk_head_dim",
+            "v_head_dim",
+            "rotary_emb",
+            "kv_b_proj",
+            "o_proj",
+            "indexer",
+            "q_b_proj",
+        )
+        missing_kwargs = [name for name in required_kwargs if name not in kwargs]
+        if missing_kwargs:
+            raise RuntimeError(
+                "FLSFABackend requires the FL MultiHeadLatentAttentionWrapper "
+                "kwargs, but the current MLA wrapper did not provide: "
+                f"{missing_kwargs}. Enable the FL MLA OOT wrapper with "
+                "VLLM_FL_ENABLE_MLA_OOT=1 and do not blacklist "
+                "MultiHeadLatentAttentionWrapper, or use the native "
+                "FLASHMLA_SPARSE backend."
+            )
         self.q_lora_rank = kwargs["q_lora_rank"]
         self.kv_lora_rank = kwargs["kv_lora_rank"]
         self.qk_nope_head_dim = kwargs["qk_nope_head_dim"]

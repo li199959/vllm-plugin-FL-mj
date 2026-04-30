@@ -273,6 +273,20 @@ def is_oot_enabled() -> bool:
     return enabled_str.lower() in ("1", "true")
 
 
+def enable_mla_oot() -> bool:
+    """True when the FL MLA wrapper/SFA backend path is explicitly enabled.
+
+    Keep this opt-in because the FL wrapper passes extra kwargs and expects
+    different q_b/kv_b projection sharding than native vLLM MLA backends.
+    """
+    return os.environ.get("VLLM_FL_ENABLE_MLA_OOT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def dispose_tensor(x: torch.Tensor):
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
 
