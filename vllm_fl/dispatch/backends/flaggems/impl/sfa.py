@@ -756,22 +756,18 @@ class FLSFAImpl(MLAAttentionImpl):
         return ql_nope.transpose(0, 1), q_pe
 
     def _v_up_proj(self, x: torch.Tensor):
-        out: torch.Tensor = None
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.local_num_heads, self.kv_lora_rank).transpose(0, 1)
 
         if self.is_aiter_triton_fp8_bmm_enabled:
-            out = out.view(-1, self.local_num_heads, self.v_head_dim)
             # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            x = rocm_aiter_ops.triton_fp8_bmm(
-                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
+            out = rocm_aiter_ops.triton_fp8_bmm(
+                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
             )
+            out = out.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
         else:
-            # Convert from (B, N * V) to (N, B, V)
-            out = out.view(-1, self.local_num_heads, self.v_head_dim).transpose(0, 1)
-
             # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-            torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
+            out = torch.bmm(x, self.W_UV)
 
             # Convert from (N, B, V) to (B, N * V)
             out = out.transpose(0, 1).reshape(-1, self.local_num_heads * self.v_head_dim)
@@ -962,14 +958,24 @@ class FLSFAImpl(MLAAttentionImpl):
                 )
                 k_nope = k_nope.view(k_nope.shape[0], 1, -1)
                 k_pe = k_pe.view(k_pe.shape[0], 1, -1)
-                DeviceOperator.reshape_and_cache(
-                    key=k_nope[: attn_metadata.num_actual_tokens],
-                    value=k_pe[: attn_metadata.num_actual_tokens],
-                    key_cache=kv_cache[0],
-                    value_cache=kv_cache[1],
-                    slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
+                ops.concat_and_cache_mla(
+                    k_nope[: attn_metadata.num_actual_tokens],
+                    k_pe[: attn_metadata.num_actual_tokens],
+                    kv_cache,
+                    slot_mapping[: attn_metadata.num_actual_tokens].flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
                 )
         k_li = self._get_full_kv(k_li, attn_metadata)
+
+        if kv_cache is not None:
+            num_k_li_tokens = min(k_li.shape[0], attn_metadata.num_actual_tokens)
+            slots = slot_mapping[:num_k_li_tokens].to(dtype=torch.long).flatten()
+            kv_cache[2].view(-1, k_li.shape[-1]).index_copy_(
+                0,
+                slots,
+                k_li[:num_k_li_tokens].view(-1, k_li.shape[-1]),
+            )
 
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,

@@ -162,8 +162,8 @@ def mla_forward(
         hidden_states,
         kv_cache,
         attn_metadata,
-        output,
-        self.mla_attn._k_scale,
+        output=output,
+        k_scale=self.mla_attn._k_scale,
     )
     return
 
