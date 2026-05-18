@@ -20,6 +20,7 @@ except ModuleNotFoundError:
     from vllm.attention.backends.abstract import AttentionMetadata  # type: ignore
 
 from vllm_fl.vllmfl_config import get_vllm_fl_config
+from vllm_fl.utils import enable_dsa_cp
 
 
 class IndexerWrapper(nn.Module):
@@ -132,13 +133,22 @@ class FLMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         kv_cache: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        output_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        if enable_dsa_cp() and self.tp_size > 1:
+            num_tokens = hidden_states.shape[0]
+            num_tokens_pad = (
+                (num_tokens + self.tp_size - 1) // self.tp_size * self.tp_size
+            )
+            output_shape = (num_tokens_pad // self.tp_size, hidden_dim)
+        else:
+            output_shape = hidden_states.shape
+
         # FIXME: This does not seem right, should make sure the buffer is fixed
         output = torch.empty(
             output_shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
         torch.ops.vllm.mla_forward(hidden_states, output, self.prefix)
-        output = output.view(-1, output_shape[-1])
+        output = output.view(-1, hidden_dim)
         return output
 
 

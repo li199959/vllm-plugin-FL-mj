@@ -634,7 +634,7 @@ class FLSFAImpl(MLAAttentionImpl):
         if FLSFAImpl.o_proj_full_pool is None:
             sample = self.o_proj.weight
             FLSFAImpl.o_proj_full_pool = torch.empty(
-                (sample.shape[0] * self.tp_size, sample.shape[1]), dtype=sample.dtype, device=sample.device
+                (sample.shape[0], sample.shape[1] * self.tp_size), dtype=sample.dtype, device=sample.device
             )
 
         # Save TP-mode parameters (original sharded weights).  CUDA/vLLM
@@ -647,11 +647,23 @@ class FLSFAImpl(MLAAttentionImpl):
         with torch.no_grad():
             self.o_proj.weight.set_(self.o_proj_tp_weight)
 
+    def _all_gather_o_proj_weight(self) -> None:
+        """Gather RowParallel o_proj weight along its input dimension."""
+        gathered = [
+            torch.empty_like(self.o_proj_tp_weight)
+            for _ in range(self.tp_size)
+        ]
+        torch.distributed.all_gather(
+            gathered,
+            self.o_proj_tp_weight,
+            group=get_tp_group().device_group,
+        )
+        FLSFAImpl.o_proj_full_pool.copy_(torch.cat(gathered, dim=1))
+
     def _handle_o_proj_weight_switch_and_forward(
         self,
         attn_output: torch.Tensor,
         output: torch.Tensor,
-        o_proj_full_handle: torch.distributed.Work | None,
         should_shard_weight: bool,
     ) -> tuple[torch.Tensor, bool]:
         """
@@ -659,10 +671,6 @@ class FLSFAImpl(MLAAttentionImpl):
         """
         # Gather o_proj weight from all TP ranks for Full-mode computation
         if should_shard_weight:
-            # Wait for the completion of o_proj weight all-gather operation
-            if o_proj_full_handle is not None:
-                o_proj_full_handle.wait()
-
             # Switch o_proj to Full-mode (gathered weight from all TP ranks)
             with torch.no_grad():
                 self.o_proj.weight.set_(FLSFAImpl.o_proj_full_pool)
@@ -881,10 +889,12 @@ class FLSFAImpl(MLAAttentionImpl):
         slot_mapping_cp = None
         if self.enable_dsa_cp:
             assert attn_metadata.dsa_cp_context is not None
+            dsa_cp_context = attn_metadata.dsa_cp_context
             slot_mapping_cp = attn_metadata.dsa_cp_context.slot_mapping_cp
             actual_seq_lengths_query = attn_metadata.dsa_cp_context.actual_seq_lengths_query
             actual_seq_lengths_key = attn_metadata.dsa_cp_context.actual_seq_lengths_key
         else:
+            dsa_cp_context = None
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
 
@@ -892,11 +902,28 @@ class FLSFAImpl(MLAAttentionImpl):
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
 
-        o_proj_full_handle = None
         full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
             AttentionFLState.DecodeOnly,
             AttentionFLState.SpecDecoding,
         }
+
+        if dsa_cp_context is not None:
+            if hidden_states.shape[0] < dsa_cp_context.num_tokens_pad:
+                hidden_pad_size = (
+                    dsa_cp_context.num_tokens_pad - hidden_states.shape[0]
+                )
+                hidden_states = nn.functional.pad(
+                    hidden_states,
+                    (0, 0, 0, hidden_pad_size),
+                )
+            hidden_states = hidden_states[
+                dsa_cp_context.local_start : dsa_cp_context.local_end_with_pad
+            ]
+            assert hidden_states.shape[0] == slot_mapping_cp.shape[0], (
+                "DSA-CP hidden_states and local slot_mapping must have the "
+                f"same token count, got {hidden_states.shape[0]} and "
+                f"{slot_mapping_cp.shape[0]}."
+            )
 
         assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
@@ -943,11 +970,7 @@ class FLSFAImpl(MLAAttentionImpl):
                     if is_hidden_layer(layer):
                         reach_layer_for_shard_weight_series(layer)
             elif full_gather_o_proj_enabled:
-                _, o_proj_full_handle = all_gather_async(
-                    self.o_proj_tp_weight,
-                    get_tp_group(),
-                    output=FLSFAImpl.o_proj_full_pool,
-                )
+                self._all_gather_o_proj_weight()
 
             if kv_cache is not None:
                 assert fused_kv_no_split is not None
@@ -999,7 +1022,6 @@ class FLSFAImpl(MLAAttentionImpl):
             result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
                 attn_output=attn_output,
                 output=output,
-                o_proj_full_handle=o_proj_full_handle,
                 should_shard_weight=full_gather_o_proj_enabled,
             )
             if require_o_proj_forward:
