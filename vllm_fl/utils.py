@@ -324,10 +324,11 @@ def enable_sp() -> bool:
     on row-parallel outputs so hidden_states is num_tokens/tp_size."""
     from vllm.config import get_current_vllm_config
 
-    if not _is_dsa_cp_model():
+    if not (_is_dsa_cp_model() and enable_mla_oot()):
         return False
     vllm_config = get_current_vllm_config()
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    parallel_config = vllm_config.parallel_config
+    tp_size = getattr(parallel_config, "tensor_parallel_size", 1)
     return tp_size > 1
 
 
@@ -343,18 +344,25 @@ def enable_dsa_cp_with_layer_shard() -> bool:
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
-    is_prefill_instance = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_producer
+    kv_transfer_config = vllm_config.kv_transfer_config
+    is_prefill_instance = kv_transfer_config is not None and (
+        getattr(kv_transfer_config, "is_kv_producer", False)
+        or getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+    )
     return is_prefill_instance
 
+
+@lru_cache(maxsize=1)
 def enable_dsa_cp_with_o_proj_tp() -> bool:
     if not enable_dsa_cp():
         return False
     from vllm.config import get_current_vllm_config
 
     vllm_config = get_current_vllm_config()
+    kv_transfer_config = vllm_config.kv_transfer_config
     # if is PD mix stage, using original TP o_proj weight, and also need to
     # full gather for o_proj weight for prefill stage.
-    return vllm_config.kv_transfer_config is None
+    return kv_transfer_config is None or getattr(kv_transfer_config, "kv_role", None) == "kv_both"
 
 
 def _round_up(x: int, align: int):

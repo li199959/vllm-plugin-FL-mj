@@ -154,7 +154,8 @@ class SequenceRowParallelOp(CustomRowParallelOp):
         elif is_sp_enabled():
             x = input_parallel
             pad_size = get_sp_pad_size()
-            if pad_size > 0:
+            layer_prefix = self.layer.prefix or ""
+            if pad_size > 0 and "o_proj" not in layer_prefix:
                 x = F.pad(x, (0, 0, 0, pad_size))
             output_parallel = self.quant_method.apply(self.layer, x, bias=bias_)
             output = tensor_model_parallel_reduce_scatter(output_parallel, 0)
@@ -183,7 +184,13 @@ def _get_column_parallel_op(prefix, layer):
     if enable_sp():
         if "shared_expert" in prefix:
             return None
-        sp_prefixes = ["gate_up_proj", "qkv_proj"]
+        sp_prefixes = [
+            "gate_up_proj",
+            "in_proj",
+            "qkv_proj",
+            "conv1d",
+            "query_key_value",
+        ]
         for p in sp_prefixes:
             if p in prefix:
                 return SequenceColumnParallelOp(layer)
@@ -198,7 +205,12 @@ def _get_row_parallel_op(prefix, layer):
     if enable_sp():
         if "shared_expert" in prefix:
             return None
-        sp_prefixes = ["o_proj", "down_proj"]
+        sp_prefixes = [
+            "o_proj",
+            "out_proj",
+            "down_proj",
+            "attention.dense",
+        ]
         for p in sp_prefixes:
             if p in prefix:
                 return SequenceRowParallelOp(layer)
