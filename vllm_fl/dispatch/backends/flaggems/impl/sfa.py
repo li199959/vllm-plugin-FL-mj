@@ -585,6 +585,8 @@ class FLSFAImpl(MLAAttentionImpl):
             for layer in self.layer_sharding_kwargs or []:
                 if is_hidden_layer(layer):
                     post_process_after_loading_for_shard_weight_series(layer)
+        if self.enable_dsa_cp_with_o_proj_tp:
+            self._init_o_proj_tp_full_params()
 
     def forward_mha(
         self,
@@ -635,22 +637,15 @@ class FLSFAImpl(MLAAttentionImpl):
                 (sample.shape[0] * self.tp_size, sample.shape[1]), dtype=sample.dtype, device=sample.device
             )
 
-        # Save TP-mode parameters (original sharded weights)
+        # Save TP-mode parameters (original sharded weights).  CUDA/vLLM
+        # quant methods keep the relevant metadata on the layer, so we only
+        # swap the weight tensor here; Ascend-specific aclnn attrs do not
+        # exist in this backend.
         self.o_proj_tp_weight = self.o_proj.weight.clone().detach()
-        self.o_proj_tp_aclnn_input_scale = self.o_proj.aclnn_input_scale.clone().detach()
-        self.o_proj_tp_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.clone().detach()
-        self.o_proj_tp_aclnn_input_offset = self.o_proj.aclnn_input_offset.clone().detach()
 
         # Initially switch to TP mode for graph capture
-        self.o_proj.weight.set_(self.o_proj_tp_weight)
-        self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
-        self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
-        self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
-
-        # Precompute Full-mode quantization parameters by repeating TP parameters across all TP ranks
-        self.o_proj_full_aclnn_input_scale = self.o_proj.aclnn_input_scale.repeat(self.tp_size)
-        self.o_proj_full_aclnn_input_scale_reciprocal = self.o_proj.aclnn_input_scale_reciprocal.repeat(self.tp_size)
-        self.o_proj_full_aclnn_input_offset = self.o_proj.aclnn_input_offset.repeat(self.tp_size)
+        with torch.no_grad():
+            self.o_proj.weight.set_(self.o_proj_tp_weight)
 
     def _handle_o_proj_weight_switch_and_forward(
         self,
@@ -669,19 +664,19 @@ class FLSFAImpl(MLAAttentionImpl):
                 o_proj_full_handle.wait()
 
             # Switch o_proj to Full-mode (gathered weight from all TP ranks)
-            self.o_proj.weight.set_(FLSFAImpl.o_proj_full_pool)
-            self.o_proj.aclnn_input_scale.set_(self.o_proj_full_aclnn_input_scale)
-            self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_full_aclnn_input_scale_reciprocal)
-            self.o_proj.aclnn_input_offset.set_(self.o_proj_full_aclnn_input_offset)
-
-            # Apply quantization method and execute forward computation
-            output[...] = self.o_proj.quant_method.quant_method.apply(self.o_proj, attn_output)
-
-            # Switch o_proj back to TP-mode for subsequent decode operations
-            self.o_proj.weight.set_(self.o_proj_tp_weight)
-            self.o_proj.aclnn_input_scale.set_(self.o_proj_tp_aclnn_input_scale)
-            self.o_proj.aclnn_input_scale_reciprocal.set_(self.o_proj_tp_aclnn_input_scale_reciprocal)
-            self.o_proj.aclnn_input_offset.set_(self.o_proj_tp_aclnn_input_offset)
+            with torch.no_grad():
+                self.o_proj.weight.set_(FLSFAImpl.o_proj_full_pool)
+            try:
+                quant_method = getattr(
+                    self.o_proj.quant_method,
+                    "quant_method",
+                    self.o_proj.quant_method,
+                )
+                output[...] = quant_method.apply(self.o_proj, attn_output, bias=None)
+            finally:
+                # Switch o_proj back to TP-mode for subsequent decode operations.
+                with torch.no_grad():
+                    self.o_proj.weight.set_(self.o_proj_tp_weight)
 
             return output, False
         else:
@@ -897,15 +892,11 @@ class FLSFAImpl(MLAAttentionImpl):
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
 
-        # all-gather o_proj weight for prefill stage of PD mix node
-        # TODO: need to distinct PD-mixed and PD-disaggregated
-        # o_proj_full_handle = None
-        # # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
-        # # weight for prefill stage.
-        # full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
-        #     AttentionFLState.DecodeOnly,
-        #     AttentionFLState.SpecDecoding,
-        # }
+        o_proj_full_handle = None
+        full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
+            AttentionFLState.DecodeOnly,
+            AttentionFLState.SpecDecoding,
+        }
 
         assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
         qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
@@ -926,8 +917,8 @@ class FLSFAImpl(MLAAttentionImpl):
             assert k_pe is not None
             assert k_nope is not None
             assert k_li is not None
-            # TODO: need to distinct PD-mixed and PD-disaggregated
-            # support all_gather kv async for communication calculation overlap
+            async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
+            # Support all-gather KV async for communication/calculation overlap.
             fused_kv_no_split, kv_ag_handle = all_gather_async(
                 torch.cat(
                     [
@@ -938,6 +929,7 @@ class FLSFAImpl(MLAAttentionImpl):
                     dim=1,
                 ),
                 get_tp_group(),
+                async_op=async_op,
             )
         ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
         q_pe = self.rope_single_query(q_pe, cos, sin)
@@ -946,10 +938,16 @@ class FLSFAImpl(MLAAttentionImpl):
             if kv_ag_handle is not None:
                 kv_ag_handle.wait()
 
-            # TODO: need to distinct PD-mixed and PD-disaggregated
-            for layer in self.layer_sharding_kwargs or []:
-                if is_hidden_layer(layer):
-                    reach_layer_for_shard_weight_series(layer)
+            if self.enable_dsa_cp_with_layer_shard:
+                for layer in self.layer_sharding_kwargs or []:
+                    if is_hidden_layer(layer):
+                        reach_layer_for_shard_weight_series(layer)
+            elif full_gather_o_proj_enabled:
+                _, o_proj_full_handle = all_gather_async(
+                    self.o_proj_tp_weight,
+                    get_tp_group(),
+                    output=FLSFAImpl.o_proj_full_pool,
+                )
 
             if kv_cache is not None:
                 assert fused_kv_no_split is not None
@@ -994,8 +992,20 @@ class FLSFAImpl(MLAAttentionImpl):
 
         attn_output = self._v_up_proj(attn_output)
 
-        # TODO: need to distinct PD-mixed and PD-disaggregated
-        output[...] = self.o_proj(attn_output)[0]
+        if self.enable_dsa_cp_with_o_proj_tp:
+            # SFA-CP has full-head attention output.  Prefill switches o_proj
+            # to gathered full weight; decode redistributes activation back to
+            # the TP-local layout before the normal row-parallel o_proj.
+            result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
+                attn_output=attn_output,
+                output=output,
+                o_proj_full_handle=o_proj_full_handle,
+                should_shard_weight=full_gather_o_proj_enabled,
+            )
+            if require_o_proj_forward:
+                output[...] = self.o_proj(result)[0]
+        else:
+            output[...] = self.o_proj(attn_output)[0]
 
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
